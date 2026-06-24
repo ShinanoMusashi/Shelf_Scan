@@ -1,0 +1,18 @@
+// ShelfScape build — plain Java Swing app, no third-party dependencies.
+plugins {
+    id 'application'
+}
+
+repositories {
+    mavenCentral()
+}
+
+application {
+    mainClass = 'shelfscape.app.MainApp'
+}
+
+// Compile against a broadly-available Java version so others can build/run it.
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+    options.encoding = 'UTF-8'
+}

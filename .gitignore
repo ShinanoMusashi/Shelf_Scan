@@ -3,6 +3,10 @@ bin/
 out/
 *.class
 
+# Gradle
+.gradle/
+build/
+
 # Runtime data (per-machine local library)
 shelfscape_archive.txt
 
