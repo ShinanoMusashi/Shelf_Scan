@@ -1,0 +1,19 @@
+# Build output
+bin/
+out/
+*.class
+
+# Runtime data (per-machine local library)
+shelfscape_archive.txt
+
+# IDE / tooling
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+.vscode/
+.claude/
+
+# OS
+.DS_Store
