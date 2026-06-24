@@ -16,6 +16,7 @@ public class Book {
     private String description;
     private Rectangle bbox;
     private ReadingStatus status = ReadingStatus.NONE;
+    private int row;   // which shelf row this book sits on (0 = top), set by the scan
 
     // Empty book, this is use when rebuilding from a saved line.
     public Book() {
@@ -83,8 +84,17 @@ public class Book {
         this.status = status;
     }
 
-    // Field order: title, author, isbn, year, status, bx, by, bw, bh, notes.
-    // This is for saving the stuff, you told me to use toString and it's actually way easier
+    public int getRow() {
+        return row;
+    }
+
+    public void setRow(int row) {
+        this.row = row;
+    }
+
+    // Field order: title, author, isbn, year, status, bx, by, bw, bh, notes, row.
+    // This is for saving the stuff, you told me to use toString and it's actually way easier.
+    // row was added at the end so older 10-field save files still load.
     @Override
     public String toString() {
         // Box fields stay empty when there's no box.
@@ -103,7 +113,8 @@ public class Book {
                 Integer.toString(year),
                 (status == null ? ReadingStatus.NONE : status).name(),
                 bx, by, bw, bh,
-                TextLine.escape(description));
+                TextLine.escape(description),
+                Integer.toString(row));
     }
 
     // Rebuild a Book from a toString() line
@@ -128,6 +139,10 @@ public class Book {
                     parseIntSafe(f[7]), parseIntSafe(f[8])));
         }
         b.setDescription(TextLine.unescape(f[9]));
+        // row is the 11th field; older files don't have it (defaults to 0).
+        if (f.length >= 11) {
+            b.setRow(parseIntSafe(f[10]));
+        }
         return b;
     }
 

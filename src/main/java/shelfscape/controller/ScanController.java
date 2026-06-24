@@ -1,7 +1,12 @@
 // Author: Ruiqi Huang
 // Controller: runs a scan and tidies the boxes. Depends only on the VlmRecognizer interface, so the recogniser can
-// be swapped (real or demo, the demo is the fallback). Titles come from the model (for now the app does not separate
-// author from book names, this will be implemeted using a LLM model in future if I have time) the user adds the rest.
+// be swapped. Titles come from the model (for now the app does not separate author from book names, this will be
+// implemented using a LLM model in future if I have time) the user adds the rest.
+//
+// Smart scan: one quick first pass finds the shelf ROWS, then each row is re-scanned
+// in just enough horizontal tiles for the model to read small spine text. Tiles are
+// cropped from the photo, so each is sent at higher effective resolution than the
+// whole photo would be.
 package shelfscape.controller;
 
 import java.awt.Rectangle;
@@ -15,6 +20,9 @@ import java.util.List;
 import shelfscape.model.Book;
 import shelfscape.model.Detection;
 import shelfscape.model.Shelf;
+import shelfscape.scan.DetectionMerge;
+import shelfscape.scan.RowDetector;
+import shelfscape.scan.TilePlanner;
 import shelfscape.service.VlmRecognizer;
 import shelfscape.util.ImageRotation;
 
@@ -27,10 +35,9 @@ public class ScanController {
 
     private final VlmRecognizer recognizer;
 
-    // Replace the model's overlapping/imprecise boxes with boxes that do not overlap
-    // vertical strips from each book's x-position. Set false to draw the raw model boxes instead. (for this I always
-    // make it true because for now OCR position is a really strange thing it does not output exact positions, I'll improve
-    // it in the future)
+    // Replace the model's overlapping/imprecise boxes with clean non-overlapping
+    // columns from each book's x-position. Set false to draw the raw model boxes
+    // instead. (I keep it true because the OCR positions are not exact.)
     private boolean singleRowLayout = true;
 
     public ScanController(VlmRecognizer recognizer) {
@@ -43,65 +50,132 @@ public class ScanController {
     public Shelf scanShelf(BufferedImage photo, String shelfName, int rotationCw,
             ProgressListener listener) throws Exception {
 
-        // Rotate the picture!!! this is important cause OCR only read text that are in the correct orientation
-        BufferedImage forVlm = ImageRotation.rotate(photo, rotationCw);
         int origW = photo.getWidth();
         int origH = photo.getHeight();
 
-        // A response here (mainly for debugging) to show that the stuff is up and running
-        report(listener, -1, "Sending photo to MiniCPM-V OCR :)");
+        // FIRST PASS: read the whole photo once to find the rows + rough density.
+        report(listener, -1, "First pass: reading the whole photo to find the shelf rows :)");
         long t0 = System.currentTimeMillis();
-        List<Detection> detections = recognizer.detect(forVlm);
-        long vlmMs = System.currentTimeMillis() - t0;
-        report(listener, 60, String.format("Detected %d book(s) in %.1fs",
-                detections.size(), vlmMs / 1000.0));
+        List<Detection> first = scanTile(photo, new Rectangle(0, 0, origW, origH), rotationCw);
+        report(listener, 20, String.format("First pass read %d book(s) in %.1fs. Finding rows…",
+                first.size(), (System.currentTimeMillis() - t0) / 1000.0));
 
-        // Put the box back on to the image and show it
-        if (rotationCw != 0) {
-            for (Detection d : detections) {
-                if (d.getBbox() != null) {
-                    d.setBbox(ImageRotation.unrotateRect(d.getBbox(), rotationCw, origW, origH));
-                }
+        // Group the detections into shelf rows.
+        List<List<Detection>> rows = RowDetector.detectRows(first);
+        if (rows.isEmpty()) {
+            rows = new ArrayList<>();
+            rows.add(first); // nothing had a box — keep whatever we got as one row
+        }
+
+        // Decide how many detail tiles each row needs (rows that read fine reuse
+        // the first pass, so they cost no extra scan).
+        int[] tilesPerRow = new int[rows.size()];
+        int plannedTiles = 0;
+        for (int r = 0; r < rows.size(); r++) {
+            Rectangle band = bandOf(rows.get(r), origW, origH);
+            tilesPerRow[r] = TilePlanner.tilesForRow(rows.get(r).size(), band.width);
+            if (tilesPerRow[r] > 1) {
+                plannedTiles += tilesPerRow[r];
             }
         }
-
-        // Here we assume that the user only selected one row, so we can use the x coordinate to determine the order
-        detections.sort(Comparator.comparingInt(ScanController::centreX));
-
-        // In case the box is actually overlapping we will replace them
-        if (singleRowLayout) {
-            applySingleRowLayout(detections, origW, origH);
-        }
+        report(listener, 30, String.format("Found %d row(s); scanning %d detail tile(s)…",
+                rows.size(), plannedTiles));
 
         Shelf shelf = new Shelf(generateId(), shelfName);
         shelf.setScanDate(LocalDate.now().toString());
 
-        int index = 0;
-        int total = Math.max(1, detections.size());
-        for (Detection detection : detections) {
-            index++;
-            // Title and box from the VLM; the user fills in author/ISBN/etc
-            shelf.addBook(new Book(detection.getRawTitle(), detection.getBbox()));
-            int percent = 60 + (int) (40.0 * index / total);
-            report(listener, percent, "Added “" + detection.getRawTitle() + "”");
+        int doneTiles = 0;
+        for (int r = 0; r < rows.size(); r++) {
+            List<Detection> rowDets;
+            if (tilesPerRow[r] <= 1) {
+                rowDets = rows.get(r); // first pass already read this row well enough
+            } else {
+                Rectangle band = bandOf(rows.get(r), origW, origH);
+                List<Rectangle> tiles = TilePlanner.horizontalTiles(band, tilesPerRow[r]);
+                rowDets = new ArrayList<>();
+                for (int t = 0; t < tiles.size(); t++) {
+                    rowDets.addAll(scanTile(photo, tiles.get(t), rotationCw));
+                    doneTiles++;
+                    int percent = 30 + (int) (65.0 * doneTiles / Math.max(1, plannedTiles));
+                    report(listener, percent, String.format("Row %d/%d: scanned tile %d/%d",
+                            r + 1, rows.size(), t + 1, tiles.size()));
+                }
+                // Overlapping tiles double-detect books on the seams — drop those.
+                rowDets = DetectionMerge.dedupe(rowDets);
+            }
+
+            // Order left-to-right and tidy into clean, non-overlapping columns.
+            rowDets.sort(Comparator.comparingInt(ScanController::centreX));
+            if (singleRowLayout) {
+                tidyRowColumns(rowDets, origW);
+            }
+            for (Detection d : rowDets) {
+                Book b = new Book(d.getRawTitle(), d.getBbox());
+                b.setRow(r);
+                shelf.addBook(b);
+            }
         }
 
-        report(listener, 100, String.format("Done — %d book(s). VLM %.1fs.",
-                shelf.getBooks().size(), vlmMs / 1000.0));
+        report(listener, 100, String.format("Done — %d book(s) across %d row(s).",
+                shelf.getBooks().size(), rows.size()));
         return shelf;
     }
 
-    // The position of a box, I found that if the box is not drawn it will get a very very big x value so it should be
-    // at last
+    // Crop a rectangle of the photo, rotate it upright for the model, detect, then
+    // map every box back to the ORIGINAL photo's coordinates.
+    private List<Detection> scanTile(BufferedImage photo, Rectangle rect, int rotationCw)
+            throws Exception {
+        BufferedImage crop = photo.getSubimage(rect.x, rect.y, rect.width, rect.height);
+        BufferedImage forVlm = ImageRotation.rotate(crop, rotationCw);
+        List<Detection> dets = recognizer.detect(forVlm);
+        for (Detection d : dets) {
+            Rectangle box = d.getBbox();
+            if (box == null) {
+                continue;
+            }
+            // Undo the rotation (back to upright-crop pixels), then offset to the
+            // tile's place in the full photo.
+            if (rotationCw != 0) {
+                box = ImageRotation.unrotateRect(box, rotationCw, crop.getWidth(), crop.getHeight());
+            }
+            d.setBbox(new Rectangle(box.x + rect.x, box.y + rect.y, box.width, box.height));
+        }
+        return dets;
+    }
+
+    // The full-width horizontal strip a row occupies, padded a little, clamped.
+    private static Rectangle bandOf(List<Detection> row, int origW, int origH) {
+        int top = Integer.MAX_VALUE;
+        int bottom = Integer.MIN_VALUE;
+        for (Detection d : row) {
+            Rectangle b = d.getBbox();
+            if (b == null) {
+                continue;
+            }
+            top = Math.min(top, b.y);
+            bottom = Math.max(bottom, b.y + b.height);
+        }
+        if (top == Integer.MAX_VALUE) {
+            return new Rectangle(0, 0, origW, origH); // no boxes — use the whole photo
+        }
+        int pad = (int) Math.round((bottom - top) * 0.08);
+        top = clampInt(top - pad, 0, origH);
+        bottom = clampInt(bottom + pad, 0, origH);
+        return new Rectangle(0, top, origW, Math.max(1, bottom - top));
+    }
+
+    // The position of a box; a missing box gets a very big x so it sorts last.
     private static int centreX(Detection d) {
         Rectangle b = d.getBbox();
         return b == null ? Integer.MAX_VALUE : b.x + b.width / 2;
     }
 
-    // We will get the median of the box height and use that as the overall height of the books box
-    private static void applySingleRowLayout(List<Detection> detections, int origW, int origH) {
+    // Replace a row's overlapping/imprecise boxes with clean, non-overlapping
+    // columns: one shared height (the row's median) and x split at the midpoints
+    // between neighbouring book centres.
+    private static void tidyRowColumns(List<Detection> rowDets, int origW) {
         List<Detection> boxed = new ArrayList<>();
-        for (Detection d : detections) {
+        for (Detection d : rowDets) {
             if (d.getBbox() != null) {
                 boxed.add(d);
             }
@@ -110,7 +184,6 @@ public class ScanController {
         if (n == 0) {
             return;
         }
-        // Sort them!
         boxed.sort(Comparator.comparingInt(ScanController::centreX));
 
         int[] cx = new int[n];
@@ -122,17 +195,12 @@ public class ScanController {
             tops[i] = b.y;
             bottoms[i] = b.y + b.height;
         }
-
-        int top = clampInt(median(tops), 0, origH);
-        int bottom = clampInt(median(bottoms), 0, origH);
-        if (bottom - top < origH * 0.30) {
-            // In case it is too thin we will use a fixed height instead of the median
-            int mid = (top + bottom) / 2;
-            int half = (int) (origH * 0.40);
-            top = clampInt(mid - half, 0, origH);
-            bottom = clampInt(mid + half, 0, origH);
+        int top = median(tops);
+        int bottom = median(bottoms);
+        if (bottom <= top) {
+            bottom = top + 1;
         }
-        int height = Math.max(1, bottom - top);
+        int height = bottom - top;
 
         for (int i = 0; i < n; i++) {
             int leftGap = (i > 0) ? (cx[i] - cx[i - 1]) / 2

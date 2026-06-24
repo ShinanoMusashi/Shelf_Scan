@@ -19,6 +19,8 @@ import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
 import javax.swing.JPanel;
 
@@ -181,29 +183,48 @@ public class ShelfPanel extends JPanel {
     }
 
     private static final int SHELF_MARGIN = 24;
-    private static final int SHELF_GAP = 5;
-    private static final int SHELF_BOARD = 16;
+    private static final int SHELF_GAP = 5;     // gap between spines in a row
+    private static final int SHELF_BOARD = 16;  // thickness of a shelf board
+    private static final int ROW_GAP = 12;      // vertical gap between rows
+
+    // One laid-out spine: which book, where it's drawn, and which row it's in.
+    private static final class Spine {
+        final Book book;
+        final Rectangle rect;
+        final int row;
+
+        Spine(Book book, Rectangle rect, int row) {
+            this.book = book;
+            this.rect = rect;
+            this.row = row;
+        }
+    }
 
     private void drawBookshelf(Graphics2D g2) {
         // Warm "wall" backdrop.
         g2.setColor(new Color(0x3A, 0x30, 0x28));
         g2.fillRect(0, 0, getWidth(), getHeight());
 
-        List<Book> books = shelf.getBooks();
-        List<Rectangle> spines = computeShelfSpines();
-        int baseline = getHeight() - SHELF_MARGIN - SHELF_BOARD;
+        List<Spine> spines = layoutSpines();
 
-        // The shelf board the books sit on.
-        g2.setColor(new Color(0x6B, 0x47, 0x2F));
-        g2.fillRect(SHELF_MARGIN - 8, baseline, getWidth() - 2 * SHELF_MARGIN + 16, SHELF_BOARD);
-        g2.setColor(new Color(0x4A, 0x30, 0x20));
-        g2.drawRect(SHELF_MARGIN - 8, baseline, getWidth() - 2 * SHELF_MARGIN + 16, SHELF_BOARD);
+        // Draw a board under each row (board top = the lowest spine bottom in it).
+        Map<Integer, Integer> rowBaseline = new TreeMap<>();
+        for (Spine s : spines) {
+            rowBaseline.merge(s.row, s.rect.y + s.rect.height, Math::max);
+        }
+        for (int baseline : rowBaseline.values()) {
+            g2.setColor(new Color(0x6B, 0x47, 0x2F));
+            g2.fillRect(SHELF_MARGIN - 8, baseline, getWidth() - 2 * SHELF_MARGIN + 16, SHELF_BOARD);
+            g2.setColor(new Color(0x4A, 0x30, 0x20));
+            g2.drawRect(SHELF_MARGIN - 8, baseline, getWidth() - 2 * SHELF_MARGIN + 16, SHELF_BOARD);
+        }
 
+        // Draw the spines.
         for (int i = 0; i < spines.size(); i++) {
-            Rectangle r = spines.get(i);
-            Book book = books.get(i);
+            Spine s = spines.get(i);
+            Rectangle r = s.rect;
             Color base = PALETTE[i % PALETTE.length];
-            boolean selected = book == selectedBook;
+            boolean selected = s.book == selectedBook;
 
             g2.setColor(base);
             g2.fillRect(r.x, r.y, r.width, r.height);
@@ -216,35 +237,57 @@ public class ShelfPanel extends JPanel {
             g2.setStroke(new BasicStroke(selected ? 3f : 1.5f));
             g2.drawRect(r.x, r.y, r.width, r.height);
 
-            drawSpineLabel(g2, r, book.getTitle());
+            drawSpineLabel(g2, r, s.book.getTitle());
         }
     }
 
-    // Lay the books out as evenly spaced spines (in their existing left-to-right
-    // order). Heights vary a little per title so it looks natural. One rect per book.
-    private List<Rectangle> computeShelfSpines() {
-        List<Rectangle> rects = new ArrayList<>();
+    // Lay every book out as a spine, stacking the shelf rows top-to-bottom. Within
+    // a row the books keep their left-to-right order; heights vary a little per
+    // title so it looks natural.
+    private List<Spine> layoutSpines() {
+        List<Spine> out = new ArrayList<>();
         if (shelf == null) {
-            return rects;
+            return out;
         }
-        List<Book> books = shelf.getBooks();
-        int n = books.size();
-        if (n == 0) {
-            return rects;
+        List<List<Book>> rows = booksByRow();
+        int rowCount = rows.size();
+        if (rowCount == 0) {
+            return out;
         }
         int availW = getWidth() - 2 * SHELF_MARGIN;
-        int availH = getHeight() - 2 * SHELF_MARGIN - SHELF_BOARD;
-        if (availW <= 0 || availH <= 0) {
-            return rects;
+        int totalH = getHeight() - 2 * SHELF_MARGIN - (rowCount - 1) * ROW_GAP;
+        if (availW <= 0 || totalH <= 0) {
+            return out;
         }
-        int spineW = Math.max(6, (availW - (n - 1) * SHELF_GAP) / n);
-        int baseline = getHeight() - SHELF_MARGIN - SHELF_BOARD;
-        for (int i = 0; i < n; i++) {
-            int x = SHELF_MARGIN + i * (spineW + SHELF_GAP);
-            int h = spineHeight(books.get(i), availH);
-            rects.add(new Rectangle(x, baseline - h, spineW, h));
+        int rowH = totalH / rowCount;            // height per row, incl. its board
+        int spineMaxH = Math.max(1, rowH - SHELF_BOARD);
+
+        for (int r = 0; r < rowCount; r++) {
+            List<Book> rowBooks = rows.get(r);
+            int n = rowBooks.size();
+            if (n == 0) {
+                continue;
+            }
+            int rowTop = SHELF_MARGIN + r * (rowH + ROW_GAP);
+            int baseline = rowTop + rowH - SHELF_BOARD;
+            int spineW = Math.max(6, (availW - (n - 1) * SHELF_GAP) / n);
+            for (int i = 0; i < n; i++) {
+                int x = SHELF_MARGIN + i * (spineW + SHELF_GAP);
+                int h = spineHeight(rowBooks.get(i), spineMaxH);
+                out.add(new Spine(rowBooks.get(i), new Rectangle(x, baseline - h, spineW, h), r));
+            }
         }
-        return rects;
+        return out;
+    }
+
+    // Group the shelf's books by row index, rows in ascending order, keeping each
+    // row's existing left-to-right order.
+    private List<List<Book>> booksByRow() {
+        Map<Integer, List<Book>> byRow = new TreeMap<>();
+        for (Book b : shelf.getBooks()) {
+            byRow.computeIfAbsent(b.getRow(), k -> new ArrayList<>()).add(b);
+        }
+        return new ArrayList<>(byRow.values());
     }
 
     // A repeatable 72-100% of the available height, varied by the title's hash.
@@ -412,16 +455,16 @@ public class ShelfPanel extends JPanel {
         if (shelf == null) {
             return null;
         }
-        List<Book> books = shelf.getBooks();
         if (mode == ViewMode.SHELF) {
-            List<Rectangle> spines = computeShelfSpines();
+            List<Spine> spines = layoutSpines();
             for (int i = spines.size() - 1; i >= 0; i--) {
-                if (spines.get(i).contains(p)) {
-                    return books.get(i);
+                if (spines.get(i).rect.contains(p)) {
+                    return spines.get(i).book;
                 }
             }
             return null;
         }
+        List<Book> books = shelf.getBooks();
         for (int i = books.size() - 1; i >= 0; i--) {
             Book book = books.get(i);
             Rectangle r = imageToPanel(book.getBbox());
