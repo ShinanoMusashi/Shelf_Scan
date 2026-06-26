@@ -12,6 +12,9 @@ persist between runs. A "bookshelf" view redraws the books as tidy ordered spine
 > and not my work — see [`NOTICE.md`](NOTICE.md). Everything under
 > `src/shelfscape/` is mine.
 
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for diagrams of how the app is
+put together (and the future phone/server target).
+
 ## Build & run
 
 Plain Java, no external libraries. Java 8+.
